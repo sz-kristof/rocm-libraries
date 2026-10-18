@@ -477,6 +477,231 @@ struct BlockFmhaPipelineQRKSVSTdm
         }
     }
 
+    // ---------------------------------------------------------------------
+    // The sink, mask/bias and LSE/O-finalization steps of the bodies below, as
+    // functions for qr_tdm_pingpong, which derives from this pipeline. The two
+    // bodies here keep their inline copies: turning them into calls computes the
+    // same values but perturbs register allocation of the kernels at the VGPR
+    // limit (d256 ALiBi went from 0 to 80 spilled VGPRs and 26% slower).
+    // ---------------------------------------------------------------------
+
+    template <typename PaddingConfig>
+    CK_TILE_DEVICE static TDMConfig MakeTdmConfig()
+    {
+        using Raw = detail::EncodedTdmPadding<PaddingConfig>;
+        TDMConfig config;
+        config.pad_enable              = Raw::kEnabled;
+        config.pad_config.pad_amount   = Raw::kPadAmount;
+        config.pad_config.pad_interval = Raw::kPadInterval;
+        return config;
+    }
+
+    // Initial row max and row sum: a finite sink pre-seeds them, unless it is
+    // merged at the end instead (kDeferSink, see MergeSink).
+    template <typename RowTile>
+    CK_TILE_DEVICE static void InitRowMaxSum(RowTile& m, RowTile& l, float sink_v, float scale_s)
+    {
+        // kDeferSink folds to false at compile time for every non-deferred instance; the
+        // else branch below must stay reachable in both cases, so this is one runtime if.
+        if(!kDeferSink && __builtin_isinf_sign(sink_v) >= 0)
+        {
+#if CK_TILE_FMHA_FWD_FAST_EXP2
+            if constexpr(BiasEnum == BlockAttentionBiasEnum::ALIBI ||
+                         BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS || kHasLogitsSoftCap)
+                set_tile(m, sink_v * scale_s * C_LOG2E);
+            else
+                set_tile(m, sink_v * C_LOG2E);
+#else
+            ignore = scale_s;
+            set_tile(m, sink_v);
+#endif
+            set_tile(l, SMPLComputeDataType{1.0f});
+        }
+        else
+        {
+            set_tile(m, -numeric<SMPLComputeDataType>::infinity());
+            clear_tile(l);
+        }
+    }
+
+    // Sink-aware K tile range of the block's rows: (sink_seq_end, seqlen_k_start,
+    // seqlen_k_end). For non-sink, sink_seq_end is always 0.
+    template <typename QOrigin>
+    CK_TILE_DEVICE static auto GetKTileRange(const FmhaMask& mask, const QOrigin& q_origin)
+    {
+        if constexpr(kHasSink)
+            return mask.GetSinkTileRangeAlongX(q_origin.at(I0), number<kM0>{}, number<kN0>{});
+        else
+        {
+            auto [start, end] =
+                mask.GetTileRangeAlongX(q_origin.at(I0), number<kM0>{}, number<kN0>{});
+            return ck_tile::make_tuple(0, start, end);
+        }
+    }
+
+    // LSE of a block with no K tile to visit: the sink alone, or -inf.
+    template <typename LSEaccDramBlockWindowTmp, typename RowTile>
+    CK_TILE_DEVICE static void StoreLseOfEmptyRows(LSEaccDramBlockWindowTmp& lse_acc_dram_window,
+                                                   const RowTile& m,
+                                                   float sink_v,
+                                                   float scale_s)
+    {
+        auto lse_acc = make_static_distributed_tensor<LSEDataType>(m.get_tile_distribution());
+        if(__builtin_isinf_sign(sink_v) >= 0)
+            set_tile(lse_acc, SMPLComputeDataType{sink_v * scale_s});
+        else
+            set_tile(lse_acc, -numeric<SMPLComputeDataType>::infinity());
+        store_tile(lse_acc_dram_window, lse_acc);
+    }
+
+    // STAGE 2 of the QK result: scale_s and the bias (elementwise or ALiBi) for the
+    // K tile starting at k_start. Without bias, scale_s is applied in the exponent.
+    // position_encoding is taken by value; Alibi::update does not change it.
+    template <typename SaccTile,
+              typename BiasDramWindow,
+              typename QOrigin,
+              typename PositionEncoding>
+    CK_TILE_DEVICE static void ApplyScaleAndBias(SaccTile& s_acc,
+                                                 const BiasDramWindow& bias_dram_window,
+                                                 const QOrigin& q_origin,
+                                                 index_t k_start,
+                                                 float scale_s,
+                                                 PositionEncoding position_encoding)
+    {
+        if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
+        {
+            // Pre-scale s_acc by scale_s before adding bias
+            tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, s_acc);
+            const auto bias_tile = load_tile(bias_dram_window);
+            tile_elementwise_inout(
+                [](auto& x, const auto& y) {
+#if !CK_TILE_FMHA_FWD_FAST_EXP2
+                    x += type_convert<SaccDataType>(y);
+#else
+                    x += log2e_v<SaccDataType> * type_convert<SaccDataType>(y);
+#endif
+                },
+                s_acc,
+                bias_tile);
+        }
+        else if constexpr(BiasEnum == BlockAttentionBiasEnum::ALIBI)
+        {
+            constexpr auto s_spans = SaccTile::get_distributed_spans();
+            sweep_tile_span(s_spans[I0], [&](auto idx0) {
+                sweep_tile_span(s_spans[I1], [&](auto idx1) {
+                    const auto tile_idx = get_x_indices_from_distributed_indices(
+                        s_acc.get_tile_distribution(), make_tuple(idx0, idx1));
+                    const auto row         = q_origin.at(I0) + tile_idx.at(I0);
+                    const auto col         = k_start + tile_idx.at(I1);
+                    constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                    s_acc(i_j_idx) *= scale_s;
+                    position_encoding.update(s_acc(i_j_idx), row, col);
+                });
+            });
+        }
+        else
+        {
+            ignore = bias_dram_window;
+            ignore = q_origin;
+            ignore = k_start;
+            ignore = scale_s;
+            ignore = position_encoding;
+        }
+    }
+
+    // -inf on the scores the K tile at k_start must not see: past seqlen_k_end on
+    // the last tile (uneven splits; kClampTail lets a body drop the check when its
+    // tile range already guarantees it) and outside the mask on edge tiles.
+    template <typename SaccTile, typename QOrigin, bool kClampTail = true>
+    CK_TILE_DEVICE static void MaskScores(SaccTile& s_acc,
+                                          const FmhaMask& mask,
+                                          const QOrigin& q_origin,
+                                          index_t k_start,
+                                          bool is_last_tile,
+                                          index_t seqlen_k_end,
+                                          bool_constant<kClampTail> = {})
+    {
+        if constexpr(kHasUnevenSplits && kClampTail)
+        {
+            if(is_last_tile)
+            {
+                set_tile_if(s_acc, -numeric<SMPLComputeDataType>::infinity(), [&](auto tile_idx) {
+                    return seqlen_k_end <= k_start + tile_idx.at(I1);
+                });
+            }
+        }
+        else
+        {
+            ignore = is_last_tile;
+            ignore = seqlen_k_end;
+        }
+
+        if constexpr(kPadSeqLenK || FmhaMask::IsMasking)
+        {
+            if(mask.IsEdgeTile(q_origin.at(I0), k_start, number<kM0>{}, number<kN0>{}))
+            {
+                set_tile_if(s_acc, -numeric<SMPLComputeDataType>::infinity(), [&](auto tile_idx) {
+                    const auto row = q_origin.at(I0) + tile_idx.at(I0);
+                    const auto col = k_start + tile_idx.at(I1);
+                    if constexpr(kHasSink)
+                        return mask.IsOutOfSinkBound(row, col);
+                    else
+                        return mask.IsOutOfBound(row, col);
+                });
+            }
+        }
+    }
+
+    // LSE from the final row max m (log2 domain) and row sum l.
+    template <typename LSEaccDramBlockWindowTmp, typename RowTile>
+    CK_TILE_DEVICE static void StoreLse(LSEaccDramBlockWindowTmp& lse_acc_dram_window,
+                                        const RowTile& m,
+                                        const RowTile& l,
+                                        float scale_s)
+    {
+        auto lse_acc = make_static_distributed_tensor<LSEDataType>(m.get_tile_distribution());
+
+        constexpr auto lse_acc_spans = decltype(lse_acc)::get_distributed_spans();
+        sweep_tile_span(lse_acc_spans[I0], [&](auto idx0) {
+            constexpr auto i_idx = make_tuple(idx0);
+            if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS ||
+                         BiasEnum == BlockAttentionBiasEnum::ALIBI || kHasLogitsSoftCap)
+                lse_acc(i_idx) = m[i_idx] / C_LOG2E + log(l[i_idx]);
+            else
+                lse_acc(i_idx) = m[i_idx] * scale_s / C_LOG2E + log(l[i_idx]);
+        });
+
+        store_tile(lse_acc_dram_window, lse_acc);
+    }
+
+    // O / l (a fully masked row, l == 0, gives 0), times the V descale when it is
+    // applied on O.
+    template <typename OaccTile, typename RowTile>
+    CK_TILE_DEVICE static void NormalizeO(OaccTile& o_acc, const RowTile& l, float v_descale)
+    {
+        constexpr auto o_spans = OaccTile::get_distributed_spans();
+        sweep_tile_span(o_spans[I0], [&](auto idx0) {
+            constexpr auto i_idx = make_tuple(idx0);
+            auto tmp             = [&]() {
+                if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS ||
+                             FmhaMask::IsMasking)
+                {
+                    return l[i_idx] == 0.f ? 0.f : 1 / l[i_idx];
+                }
+                else
+                    return 1 / l[i_idx];
+            }();
+            if constexpr(kVScaleOnOacc)
+                tmp *= v_descale;
+            else
+                ignore = v_descale;
+            sweep_tile_span(o_spans[I1], [&](auto idx1) {
+                constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                o_acc(i_j_idx) *= tmp;
+            });
+        });
+    }
+
     // Re-pack gemm_0 C into gemm_1 A: C is M-outer (MIter,KIter), A is K-outer.
     // Lanes already align (NWarp==1), so this is an in-thread block reorder;
     // identity when MIterPerWarp==1.
